@@ -1,0 +1,491 @@
+!pip install accelerate
+
+import os
+import torch
+import torchaudio
+import librosa
+import numpy as np
+import pandas as pd
+import zipfile
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset, DataLoader
+from transformers import (
+    Wav2Vec2Processor, 
+    Wav2Vec2ForCTC,
+    Wav2Vec2CTCTokenizer,
+    TrainingArguments,
+    Trainer
+)
+from datasets import Dataset as HFDataset
+import jiwer
+from IPython.display import display, Audio
+import warnings
+warnings.filterwarnings('ignore')
+
+print("✅ Semua library berhasil diinstall!")
+print(f"PyTorch version: {torch.__version__}")
+print(f"Torchaudio version: {torchaudio.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+
+
+class CommonVoiceDataProcessor:
+    def __init__(self, zip_path: str, target_sample_rate: int = 16000):
+        self.zip_path = zip_path
+        self.target_sample_rate = target_sample_rate
+        self.data_dir = None
+        self.train_data = []
+        self.test_data = []
+        
+    def extract_dataset(self, extract_to: str = "/content/commonvoice"):
+        """Extract dataset dari file TAR"""
+        print("🔄 Mengekstrak dataset...")
+        
+        if os.path.exists(extract_to):
+            print(f"Dataset sudah diekstrak di {extract_to}")
+            self.data_dir = extract_to
+            return
+        
+        import tarfile
+        
+        if self.zip_path.endswith('.tar.gz') or self.zip_path.endswith('.tgz'):
+            with tarfile.open(self.zip_path, 'r:gz') as tar_ref:
+                tar_ref.extractall(extract_to)
+        elif self.zip_path.endswith('.tar'):
+            with tarfile.open(self.zip_path, 'r') as tar_ref:
+                tar_ref.extractall(extract_to)
+        else:
+            # Fallback untuk ZIP
+            with zipfile.ZipFile(self.zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_to)
+        
+        self.data_dir = extract_to
+        print(f"✅ Dataset berhasil diekstrak ke {extract_to}")
+        
+    def load_metadata(self, split: str = "validated", limit: int = 1000):
+        """Load metadata dari file TSV untuk dataset yang sudah ter-extract"""
+        print(f"📊 Loading {split} metadata...")
+
+        
+        tsv_filename = f"{split}.tsv"
+        tsv_path = os.path.join(self.data_dir, tsv_filename)
+        
+        if not os.path.exists(tsv_path):
+            available_files = [f for f in os.listdir(self.data_dir) if f.endswith('.tsv')]
+            print(f"❌ File {tsv_filename} tidak ditemukan")
+            print(f"📋 File TSV yang tersedia: {available_files}")
+            
+            if split == "train" or split == "validated":
+                if "validated.tsv" in available_files:
+                    tsv_path = os.path.join(self.data_dir, "validated.tsv")
+                    print(f"🔄 Menggunakan validated.tsv sebagai gantinya")
+                else:
+                    raise FileNotFoundError(f"File validated.tsv tidak ditemukan")
+            elif split == "test" or split == "other":
+                if "other.tsv" in available_files:
+                    tsv_path = os.path.join(self.data_dir, "other.tsv") 
+                    print(f"🔄 Menggunakan other.tsv sebagai gantinya")
+                else:
+                    raise FileNotFoundError(f"File other.tsv tidak ditemukan")
+            
+        print(f"📁 Membaca file: {tsv_path}")
+        
+        try:
+            df = pd.read_csv(tsv_path, sep='\t', encoding='utf-8')
+        except UnicodeDecodeError:
+            try:
+                df = pd.read_csv(tsv_path, sep='\t', encoding='latin-1')
+            except:
+                df = pd.read_csv(tsv_path, sep='\t', encoding='cp1252')
+            
+        print(f"Total data dalam {os.path.basename(tsv_path)}: {len(df)}")
+        print(f"Kolom tersedia: {list(df.columns)}")
+        
+        if limit:
+            df = df.head(limit)
+            
+        clips_dir = os.path.join(self.data_dir, 'clips')
+        
+        if not os.path.exists(clips_dir):
+            raise FileNotFoundError(f"Direktori clips tidak ditemukan di {clips_dir}")
+        
+        print(f"📁 Direktori audio: {clips_dir}")
+        print(f"📊 Jumlah file audio di clips: {len(os.listdir(clips_dir))}")
+        
+        processed_data = []
+        valid_count = 0
+        
+        text_column = None
+        for col in ['sentence', 'text', 'transcript']:
+            if col in df.columns:
+                text_column = col
+                break
+                
+        if text_column is None:
+            print(f"❌ Kolom teks tidak ditemukan. Kolom tersedia: {list(df.columns)}")
+            return []
+        
+        print(f"📝 Menggunakan kolom teks: {text_column}")
+        
+        for idx, row in df.iterrows():
+            audio_filename = row.get('path', row.get('filename', row.get('clip', None)))
+            
+            if audio_filename is None:
+                continue
+                
+            audio_path = os.path.join(clips_dir, audio_filename)
+            
+            if os.path.exists(audio_path) and pd.notna(row[text_column]) and str(row[text_column]).strip():
+                processed_data.append({
+                    'audio_path': audio_path,
+                    'text': str(row[text_column]).strip(),
+                    'duration': float(row.get('duration', 0)) if pd.notna(row.get('duration', 0)) else 0,
+                    'client_id': row.get('client_id', ''),
+                    'up_votes': int(row.get('up_votes', 0)) if pd.notna(row.get('up_votes', 0)) else 0,
+                    'down_votes': int(row.get('down_votes', 0)) if pd.notna(row.get('down_votes', 0)) else 0
+                })
+                valid_count += 1
+                
+            if idx % 200 == 0 and idx > 0:
+                print(f"Diproses: {idx+1}/{len(df)}, Valid: {valid_count}")
+        
+        print(f"✅ {split} data loaded: {valid_count} file audio valid dari {len(df)} total")
+        return processed_data
+    
+    def preprocess_audio(self, audio_path: str) -> Optional[np.ndarray]:
+        """Preprocessing audio: load dan resample"""
+        try:
+            audio, sr = librosa.load(audio_path, sr=self.target_sample_rate)
+            
+            audio = audio / np.max(np.abs(audio))
+            
+            return audio
+            
+        except Exception as e:
+            print(f"Error processing {audio_path}: {e}")
+            return None
+    
+    def extract_mfcc(self, audio: np.ndarray, n_mfcc: int = 13) -> np.ndarray:
+        """Extract MFCC features"""
+        mfcc = librosa.feature.mfcc(
+            y=audio, 
+            sr=self.target_sample_rate, 
+            n_mfcc=n_mfcc
+        )
+        return mfcc.T  # Transpose untuk format (time, features)
+    
+    def prepare_data(self, train_limit: int = 800, test_limit: int = 200):
+        """Persiapan data lengkap"""
+        self.extract_dataset()
+        
+        self.train_data = self.load_metadata("train", train_limit)
+        
+        try:
+            self.test_data = self.load_metadata("test", test_limit)
+        except:
+            try:
+                self.test_data = self.load_metadata("dev", test_limit)
+            except:
+                all_data = self.train_data
+                train_data, test_data = train_test_split(
+                    all_data, test_size=0.2, random_state=42
+                )
+                self.train_data = train_data
+                self.test_data = test_data
+                print("📊 Menggunakan split dari training data")
+        
+        print(f"📈 Data siap: Train={len(self.train_data)}, Test={len(self.test_data)}")
+
+
+class SpeechDataset(Dataset):
+    def __init__(self, data: List[Dict], processor, max_length: int = 16000*10):
+        self.data = data
+        self.processor = processor
+        self.max_length = max_length
+        
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        audio, _ = librosa.load(item['audio_path'], sr=16000)
+        
+        if len(audio) > self.max_length:
+            audio = audio[:self.max_length]
+        else:
+            audio = np.pad(audio, (0, self.max_length - len(audio)))
+        
+        inputs = self.processor(
+            audio,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True
+        )
+        
+        with self.processor.as_target_processor():
+            labels = self.processor(item['text'], return_tensors="pt").input_ids
+        
+        return {
+            "input_values": inputs.input_values.flatten(),
+            "labels": labels.flatten()
+        }
+
+
+class SpeechRecognitionModel:
+    def __init__(self, model_name: str = "facebook/wav2vec2-base-960h"):
+        self.model_name = model_name
+        self.processor = None
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+    def load_model(self):
+        """Load pre-trained Wav2Vec2 model"""
+        print(f"🔄 Loading model: {self.model_name}")
+        
+        self.processor = Wav2Vec2Processor.from_pretrained(self.model_name)
+        self.model = Wav2Vec2ForCTC.from_pretrained(self.model_name)
+        
+        self.model.to(self.device)
+        print(f"✅ Model loaded on {self.device}")
+        
+    def transcribe(self, audio_path: str) -> str:
+        """Transkripsi single audio file"""
+        audio, _ = librosa.load(audio_path, sr=16000)
+        
+        inputs = self.processor(
+            audio,
+            sampling_rate=16000,
+            return_tensors="pt",
+            padding=True
+        ).to(self.device)
+        
+        with torch.no_grad():
+            logits = self.model(inputs.input_values).logits
+            
+        predicted_ids = torch.argmax(logits, dim=-1)
+        transcription = self.processor.decode(predicted_ids[0])
+        
+        return transcription
+    
+    def evaluate_wer(self, test_data: List[Dict], sample_size: int = 50) -> float:
+        """Evaluasi Word Error Rate"""
+        print(f"📊 Evaluating WER pada {min(sample_size, len(test_data))} samples...")
+        
+        references = []
+        hypotheses = []
+        
+        sample_data = test_data[:sample_size] if sample_size else test_data
+        
+        for i, item in enumerate(sample_data):
+            try:
+                reference = item['text'].upper().strip()
+
+                hypothesis = self.transcribe(item['audio_path']).upper().strip()
+                
+                references.append(reference)
+                hypotheses.append(hypothesis)
+                
+                if i < 5:  # Show first 5 examples
+                    print(f"Example {i+1}:")
+                    print(f"  Reference: {reference}")
+                    print(f"  Hypothesis: {hypothesis}")
+                    print()
+                
+                if (i + 1) % 10 == 0:
+                    print(f"Progress: {i+1}/{len(sample_data)}")
+                    
+            except Exception as e:
+                print(f"Error processing sample {i}: {e}")
+                continue
+        
+        wer = jiwer.wer(references, hypotheses)
+        
+        print(f"📈 Word Error Rate (WER): {wer:.2%}")
+        return wer
+
+
+def main():
+    print("🎙️  SPEECH RECOGNITION SYSTEM - KELOMPOK 2")
+    print("="*50)
+    
+    DATASET_PATH = "/content"  # Adjust sesuai lokasi folder dataset Anda
+
+    dataset_folder = None
+    possible_folders = [
+        "/content/cv-corpus-21.0-delta-2025-03-14/en",  # Berdasarkan screenshot Anda
+        "/content/en", 
+        "/content/CommonVoice/en",
+        "/content/commonvoice/en"
+    ]
+    
+    for folder in possible_folders:
+        if os.path.exists(folder):
+            dataset_folder = folder
+            break
+
+    if not dataset_folder:
+        print("🔍 Mencari folder dataset...")
+        for root, dirs, files in os.walk("/content"):
+            if 'clips' in dirs and any(f.endswith('.tsv') for f in files):
+                dataset_folder = root
+                print(f"📁 Dataset ditemukan di: {dataset_folder}")
+                break
+    
+    if not dataset_folder:
+        print("❌ Folder dataset tidak ditemukan!")
+        print("📁 Pastikan dataset sudah ter-extract dengan struktur:")
+        print("   - clips/ (folder berisi file audio)")
+        print("   - *.tsv (file metadata)")
+        
+        print("\n📋 Struktur folder di /content:")
+        for root, dirs, files in os.walk("/content"):
+            level = root.replace("/content", "").count(os.sep)
+            if level < 3:  # Limit depth
+                indent = "  " * level
+                print(f"{indent}{os.path.basename(root)}/")
+                subindent = "  " * (level + 1)
+                for file in files[:3]:
+                    print(f"{subindent}{file}")
+                if len(files) > 3:
+                    print(f"{subindent}... +{len(files)-3} files")
+        return
+ 
+    print("\n1️⃣ PERSIAPAN DATA")
+    print("-" * 30)
+    
+    processor = CommonVoiceDataProcessor("dummy_path")  # Path tidak digunakan karena sudah extract
+    processor.data_dir = dataset_folder
+    print(f"📁 Menggunakan dataset di: {dataset_folder}")
+    
+    try:
+        processor.train_data = processor.load_metadata("validated", limit=800)  # Gunakan validated.tsv
+        processor.test_data = processor.load_metadata("other", limit=200)       # Gunakan other.tsv sebagai test
+    except:
+        try:
+            # Fallback ke file yang tersedia
+            processor.train_data = processor.load_metadata("validated_sentences", limit=800)
+            processor.test_data = processor.load_metadata("invalidated", limit=200) 
+        except:
+            print("❌ Tidak dapat memuat metadata")
+            print("📋 File TSV yang tersedia:")
+            tsv_files = [f for f in os.listdir(dataset_folder) if f.endswith('.tsv')]
+            for tsv_file in tsv_files:
+                print(f"  - {tsv_file}")
+            return
+    
+
+    print("\n2️⃣ SETUP MODEL")
+    print("-" * 30)
+    
+    speech_model = SpeechRecognitionModel()
+    speech_model.load_model()
+    
+
+    print("\n3️⃣ EVALUASI MODEL")
+    print("-" * 30)
+    
+    wer_score = speech_model.evaluate_wer(processor.test_data, sample_size=20)
+    
+
+    print("\n4️⃣ DEMO TRANSKRIPSI")
+    print("-" * 30)
+    
+    if processor.test_data:
+        print("🎯 Menguji beberapa file audio...")
+        
+        for i in range(min(3, len(processor.test_data))):
+            item = processor.test_data[i]
+            print(f"\nSample {i+1}:")
+            print(f"📁 File: {os.path.basename(item['audio_path'])}")
+            
+
+            try:
+                display(Audio(item['audio_path']))
+            except:
+                print("Cannot display audio")
+            
+            print(f"📝 Ground Truth: {item['text']}")
+            
+            try:
+                transcription = speech_model.transcribe(item['audio_path'])
+                print(f"🤖 Prediction: {transcription}")
+                
+
+                sample_wer = jiwer.wer([item['text']], [transcription])
+                print(f"📊 Sample WER: {sample_wer:.2%}")
+                
+            except Exception as e:
+                print(f"❌ Error in transcription: {e}")
+    
+ 
+    print("\n5️⃣ RINGKASAN HASIL")
+    print("-" * 30)
+    print(f"📊 Total Train Data: {len(processor.train_data)}")
+    print(f"📊 Total Test Data: {len(processor.test_data)}")
+    print(f"📈 Word Error Rate: {wer_score:.2%}")
+    print(f"🎯 Target WER: < 30%")
+    print(f"✅ Status: {'TERCAPAI' if wer_score < 0.30 else 'BELUM TERCAPAI'}")
+    
+
+    if len(processor.test_data) > 0:
+        print("\n6️⃣ VISUALISASI AUDIO")
+        print("-" * 30)
+        
+        sample_audio_path = processor.test_data[0]['audio_path']
+        audio, sr = librosa.load(sample_audio_path, sr=16000)
+        
+        plt.figure(figsize=(12, 4))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(audio)
+        plt.title('Audio Waveform')
+        plt.xlabel('Sample')
+        plt.ylabel('Amplitude')
+        
+        plt.subplot(1, 2, 2)
+        D = librosa.amplitude_to_db(np.abs(librosa.stft(audio)), ref=np.max)
+        librosa.display.specshow(D, sr=sr, x_axis='time', y_axis='hz')
+        plt.colorbar(format='%+2.0f dB')
+        plt.title('Spectrogram')
+        
+        plt.tight_layout()
+        plt.show()
+
+
+
+def upload_and_transcribe():
+    from google.colab import files
+    
+    print("📤 Upload file audio untuk ditranskripsi:")
+    uploaded = files.upload()
+    
+    if uploaded:
+        speech_model = SpeechRecognitionModel()
+        speech_model.load_model()
+        
+        for filename in uploaded.keys():
+            print(f"\n🎙️ Memproses: {filename}")
+            try:
+                transcription = speech_model.transcribe(filename)
+                print(f"📝 Hasil transkripsi: {transcription}")
+                
+                display(Audio(filename))
+                
+            except Exception as e:
+                print(f"❌ Error: {e}")
+
+
+
+if __name__ == "__main__":
+    main()
+    
+    print("\n" + "="*50)
+    print("✅ PROGRAM SELESAI")
+    print("💡 Untuk menguji file audio custom, jalankan:")
+    print("   upload_and_transcribe()")
+    print("="*50)
